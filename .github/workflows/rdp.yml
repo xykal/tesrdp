@@ -1,0 +1,375 @@
+name: Windows 10 RDP Sandbox
+
+on:
+  workflow_dispatch:
+
+# Repo-wide default: no implicit GitHub token writes, no cache scope.
+permissions:
+  contents: read
+
+# Bump this when you want to invalidate an old run before it times out.
+concurrency:
+  group: rdp-sandbox
+  cancel-in-progress: true
+
+jobs:
+  rdp:
+    name: Win10-style RDP session
+    # windows-latest = Server 2025 (Win11 base). We strip Win11 features
+    # below to make it feel and behave like Windows 10 LTSC.
+    runs-on: windows-latest
+    timeout-minutes: 360
+    permissions:
+      contents: read
+
+    env:
+      RDP_USER: rdpuser
+      RDP_PASSWORD: RdpFree@2026
+      TUNNEL_LOG: cloudflared.log
+
+    steps:
+      # ----------------------------------------------------------------
+      # 0. Clean up anything left from a previous run on this same VM
+      # ----------------------------------------------------------------
+      - name: Cleanup leftovers from previous run
+        shell: pwsh
+        run: |
+          Get-Process cloudflared -ErrorAction SilentlyContinue | Stop-Process -Force
+          Remove-Item "$env:USERPROFILE\cloudflared*.log" -Force -ErrorAction SilentlyContinue
+          Remove-Item "$env:USERPROFILE\cloudflared.exe"  -Force -ErrorAction SilentlyContinue
+
+      # ----------------------------------------------------------------
+      # 1. Enable RDP + disable NLA
+      # ----------------------------------------------------------------
+      - name: Enable RDP + firewall
+        shell: pwsh
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Set-NetFirewallRule -DisplayName "Remote Desktop - User Mode (TCP-In)"  -Enabled True -ErrorAction SilentlyContinue
+          Set-NetFirewallRule -DisplayName "Remote Desktop - User Mode (UDP-In)"  -Enabled True -ErrorAction SilentlyContinue
+
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service TermService -ErrorAction SilentlyContinue
+
+          # Disable NLA so XyDesk Remote / mstsc without NLA can connect
+          $tcp = 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
+          Set-ItemProperty -Path $tcp -Name "UserAuthentication" -Value 0
+          Set-ItemProperty -Path $tcp -Name "SecurityLayer"      -Value 0
+
+      # ----------------------------------------------------------------
+      # 2. Configure RDP user
+      # ----------------------------------------------------------------
+      - name: Configure RDP user
+        shell: pwsh
+        run: |
+          $user = $env:RDP_USER
+          $pass = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+
+          $exists = Get-LocalUser -Name $user -ErrorAction SilentlyContinue
+          if ($exists) {
+              Set-LocalUser -Name $user -Password $pass
+          } else {
+              New-LocalUser -Name $user -Password $pass -FullName "RDP User" -Description "Temporary sandbox user"
+          }
+
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $user -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Users"                -Member $user -ErrorAction SilentlyContinue
+
+      # ----------------------------------------------------------------
+      # 3. DEBLOAT — remove Win11 bloat + inbox apps
+      # ----------------------------------------------------------------
+      - name: Debloat inbox apps
+        shell: pwsh
+        run: |
+          $packages = @(
+              # Inbox / Store apps
+              "*Microsoft.BingNews*"
+              "*Microsoft.BingWeather*"
+              "*Microsoft.GetHelp*"
+              "*Microsoft.Getstarted*"
+              "*Microsoft.MicrosoftOfficeHub*"
+              "*Microsoft.MicrosoftSolitaireCollection*"
+              "*Microsoft.People*"
+              "*Microsoft.PowerAutomateDesktop*"
+              "*Microsoft.Todos*"
+              "*Microsoft.WindowsAlarms*"
+              "*Microsoft.WindowsFeedbackHub*"
+              "*Microsoft.WindowsMaps*"
+              "*Microsoft.WindowsSoundRecorder*"
+              "*Microsoft.YourPhone*"
+              "*Microsoft.ZuneMusic*"
+              "*Microsoft.ZuneVideo*"
+              "*Clipchamp.Clipchamp*"
+              "*MicrosoftTeams*"
+              "*Microsoft.549981C3F5F10*"
+              "*Microsoft.OutlookForWindows*"
+              "*Microsoft.MicrosoftJournal*"
+              "*Microsoft.Windows.DevHome*"
+              # Win11-only AI/Widgets stuff
+              "*Microsoft.Windows.Ai.Copilot.Provider*"
+              "*Microsoft.Windows.Copilot*"
+              "*Microsoft.Windows.ExperienceHub*"
+              "*Microsoft.Windows.Widgets*"
+              "*Microsoft.WidgetsPlatformRuntime*"
+          )
+          foreach ($p in $packages) {
+              Get-AppxPackage -AllUsers -Name $p -ErrorAction SilentlyContinue | Remove-AppxPackage -ErrorAction SilentlyContinue
+              Get-AppxProvisionedPackage -Online | Where-Object DisplayName -like $p | Remove-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue
+          }
+
+      # ----------------------------------------------------------------
+      # 4. WIN11 → WIN10 LOOK & FEEL
+      #    Strip taskbar centering, widgets, Chat, Copilot, etc.
+      # ----------------------------------------------------------------
+      - name: Convert Win11 shell to Win10 style
+        shell: pwsh
+        run: |
+          $hkcu = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced'
+          $hklm = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced'
+          $pol  = 'HKLM:\Software\Policies\Microsoft\Windows'
+
+          # --- Taskbar: left-align, classic combine, never group ---
+          New-Item -Path $hkcu -Force | Out-Null
+          New-Item -Path $hklm -Force | Out-Null
+
+          # Taskbar alignment 0 = left (Win10), 1 = center (Win11)
+          Set-ItemProperty -Path $hkcu -Name "TaskbarAl" -Value 0
+          # Never combine taskbar buttons
+          Set-ItemProperty -Path $hkcu -Name "TaskbarGlomLevel" -Value 0
+          # Show taskbar buttons: 0 = always combine, 1 = combine when full, 2 = never
+          Set-ItemProperty -Path $hkcu -Name "MMTaskbarGlomLevel" -Value 2
+          # Show seconds on clock
+          Set-ItemProperty -Path $hkcu -Name "ShowSecondsInSystemClock" -Value 1
+
+          # --- Disable Win11 Chat (Meet Now), Widgets, Copilot, Task View, Search button ---
+          New-Item -Path "$pol\Windows Chat"          -Force | Out-Null
+          New-Item -Path "$pol\Dsh"                   -Force | Out-Null
+          New-Item -Path "$pol\WindowsCopilot"        -Force | Out-Null
+          New-Item -Path "$pol\Windows\Explorer"      -Force | Out-Null
+          New-Item -Path "$pol\Windows\WindowsCopilot" -Force | Out-Null
+          Set-ItemProperty -Path "$pol\Windows Chat"            -Name "ChatIcon"               -Value 0
+          Set-ItemProperty -Path "$pol\Dsh"                     -Name "AllowNewsAndInterests"  -Value 0
+          Set-ItemProperty -Path "$pol\WindowsCopilot"          -Name "TurnOffWindowsCopilot"  -Value 1
+          Set-ItemProperty -Path "$pol\Windows\Explorer"        -Name "DisableSearchBoxSuggestions" -Value 1
+
+          # --- Hide Task View button ---
+          $taskband = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Taskband'
+          New-Item -Path $taskband -Force | Out-Null
+          Set-ItemProperty -Path $taskband -Name "ShowTaskViewButton" -Value 0
+
+          # --- Action Center: keep but disable Win11 tablet-style popups ---
+          $explorerAdv = "$pol\Explorer"
+          New-Item -Path $explorerAdv -Force | Out-Null
+
+          # --- Disable lock screen + simplify notifications ---
+          New-Item -Path "$pol\Personalization" -Force | Out-Null
+          Set-ItemProperty -Path "$pol\Personalization" -Name "NoLockScreen" -Value 1
+
+          # --- Disable Bing web search in Start Menu (Win11 style) ---
+          $search = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Search'
+          New-Item -Path $search -Force | Out-Null
+          Set-ItemProperty -Path $search -Name "BingSearchEnabled"       -Value 0
+          Set-ItemProperty -Path $search -Name "CortanaConsent"          -Value 0
+
+          # --- Use the Win10-style Start menu (ShowMoreTiles off, classic layout) ---
+          $start = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Start'
+          New-Item -Path $start -Force | Out-Null
+          Set-ItemProperty -Path $start -Name "Start_Notify"     -Value 0
+          Set-ItemProperty -Path $start -Name "Start_TrackDocs"  -Value 0
+          # Show more tiles: 0 = Win10, 1 = Win11
+          Set-ItemProperty -Path $start -Name "ShowMoreTiles"   -Value 0
+
+          # --- File Explorer: open to "This PC" (Win10 default) ---
+          $fe = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced'
+          Set-ItemProperty -Path $fe -Name "LaunchTo" -Value 1
+
+          # --- Disable transparency / acrylic (faster on RDP) ---
+          $personal = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize'
+          New-Item -Path $personal -Force | Out-Null
+          Set-ItemProperty -Path $personal -Name "EnableTransparency" -Value 0
+          Set-ItemProperty -Path $personal -Name "SystemUsesLightTheme" -Value 0
+
+      # ----------------------------------------------------------------
+      # 5. DISABLE HEAVY SERVICES — biggest RAM/CPU savings
+      # ----------------------------------------------------------------
+      - name: Disable heavy background services
+        shell: pwsh
+        run: |
+          $services = @(
+              "SysMain"           # SysMain / Superfetch: very heavy on boot
+              "WSearch"           # Windows Search indexer
+              "DiagTrack"         # Connected User Experiences & Telemetry
+              "dmwappushservice"  # WAP Push Message Routing
+              "MapsBroker"        # Downloaded Maps Manager
+              "lfsvc"             # Geolocation Service
+              "RetailDemo"        # Retail demo service
+              "WMPNetworkSvc"     # Windows Media Player network sharing
+              "WerSvc"            # Windows Error Reporting
+              "TabletInputService"# Touch keyboard / handwriting
+              "XblAuthManager"    # Xbox Live auth
+              "XblGameSave"       # Xbox Live game save
+              "XboxGipSvc"        # Xbox Accessory Management
+              "XboxNetApiSvc"     # Xbox Live networking
+          )
+          foreach ($s in $services) {
+              $svc = Get-Service -Name $s -ErrorAction SilentlyContinue
+              if ($svc) {
+                  try {
+                      Stop-Service -Name $s -Force -ErrorAction SilentlyContinue
+                      Set-Service  -Name $s -StartupType Disabled -ErrorAction SilentlyContinue
+                      Write-Host "Disabled: $s"
+                  } catch {
+                      Write-Host "::warning::Could not disable $s"
+                  }
+              }
+          }
+
+          # Also kill scheduled tasks that keep the system busy
+          $tasks = @(
+              "\Microsoft\Windows\Application Experience\Microsoft Compatibility Appraiser"
+              "\Microsoft\Windows\Application Experience\ProgramDataUpdater"
+              "\Microsoft\Windows\Autochk\Proxy"
+              "\Microsoft\Windows\Customer Experience Improvement Program\Consolidator"
+              "\Microsoft\Windows\Customer Experience Improvement Program\UsbCeip"
+              "\Microsoft\Windows\DiskDiagnostic\Microsoft-Windows-DiskDiagnosticDataCollector"
+              "\Microsoft\Windows\Maps\MapsUpdateTask"
+              "\Microsoft\Windows\Maps\MapsToastTask"
+              "\Microsoft\Windows\Shell\FamilySafetyMonitor"
+              "\Microsoft\Windows\Shell\FamilySafetyRefreshTask"
+              "\Microsoft\Windows\Windows Error Reporting\QueueReporting"
+          )
+          foreach ($t in $tasks) {
+              Unregister-ScheduledTask -TaskName $t -Confirm:$false -ErrorAction SilentlyContinue
+          }
+
+      # ----------------------------------------------------------------
+      # 6. TELEMETRY / PRIVACY — kill as much as possible
+      # ----------------------------------------------------------------
+      - name: Disable telemetry
+        shell: pwsh
+        run: |
+          $pol = 'HKLM:\Software\Policies\Microsoft\Windows\DataCollection'
+          New-Item -Path $pol -Force | Out-Null
+          Set-ItemProperty -Path $pol -Name "AllowTelemetry" -Value 0
+
+          # Disable DiagTrack listener
+          Disable-ScheduledTask -TaskName "Microsoft\Windows\Application Experience\Microsoft Compatibility Appraiser" -Confirm:$false -ErrorAction SilentlyContinue
+          Disable-ScheduledTask -TaskName "Microsoft\Windows\Application Experience\ProgramDataUpdater"             -Confirm:$false -ErrorAction SilentlyContinue
+
+      # ----------------------------------------------------------------
+      # 7. WALLPAPER — solid dark, no Spotlight
+      # ----------------------------------------------------------------
+      - name: Set solid dark wallpaper (Win10 style)
+        shell: pwsh
+        run: |
+          $key = 'HKCU:\Control Panel\Desktop'
+          Set-ItemProperty -Path $key -Name "Wallpaper"      -Value ""
+          Set-ItemProperty -Path $key -Name "WallpaperStyle" -Value 0
+          Set-ItemProperty -Path $key -Name "TileWallpaper"  -Value 0
+
+          Set-ItemProperty -Path 'HKCU:\Control Panel\Colors' -Name "Background" -Value "20 22 28"
+
+          # Refresh desktop
+          $signature = @"
+          [DllImport("user32.dll")]
+          public static extern bool SystemParametersInfo(uint action, uint param, string file, uint winini);
+"@
+          $type = Add-Type -MemberDefinition $signature -Name "W" -Namespace "P" -PassThru
+          $type::SystemParametersInfo(0x0014, 0, "", 0x0003) | Out-Null
+
+      # ----------------------------------------------------------------
+      # 8. Install cloudflared
+      # ----------------------------------------------------------------
+      - name: Install cloudflared
+        shell: pwsh
+        run: |
+          $dest = Join-Path $env:USERPROFILE "cloudflared.exe"
+          $url  = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
+          Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
+          & $dest --version
+
+      # ----------------------------------------------------------------
+      # 9. Start Cloudflare quick tunnel
+      # ----------------------------------------------------------------
+      - name: Start Cloudflared tunnel
+        shell: pwsh
+        run: |
+          $exe = Join-Path $env:USERPROFILE "cloudflared.exe"
+          $arg = "tunnel --url tcp://localhost:3389 --no-autoupdate --logfile $env:USERPROFILE\$env:TUNNEL_LOG"
+
+          Start-Process -FilePath $exe -ArgumentList $arg -WindowStyle Hidden -PassThru | Out-Null
+
+          $ready = $false
+          for ($i = 0; $i -lt 40; $i++) {
+              Start-Sleep -Seconds 2
+              if (Test-Path "$env:USERPROFILE\$env:TUNNEL_LOG") {
+                  $content = Get-Content "$env:USERPROFILE\$env:TUNNEL_LOG" -Raw -ErrorAction SilentlyContinue
+                  if ($content -match 'https://[a-z0-9-]+\.trycloudflare\.com') {
+                      $ready = $true
+                      break
+                  }
+              }
+          }
+          if (-not $ready) {
+              Write-Host "::error::Cloudflared tunnel did not start in time"
+              if (Test-Path "$env:USERPROFILE\$env:TUNNEL_LOG") { Get-Content "$env:USERPROFILE\$env:TUNNEL_LOG" }
+              exit 1
+          }
+
+      # ----------------------------------------------------------------
+      # 10. Show connection info
+      # ----------------------------------------------------------------
+      - name: Show connection info
+        shell: pwsh
+        run: |
+          $log = Get-Content "$env:USERPROFILE\$env:TUNNEL_LOG" -Raw
+          if ($log -notmatch 'https://(?<host>[a-z0-9-]+)\.trycloudflare\.com') {
+              Write-Host "::error::Could not parse tunnel URL from log"
+              exit 1
+          }
+          $host = $matches['host'] + ".trycloudflare.com"
+
+          Write-Host ""
+          Write-Host "==============================================="
+          Write-Host "    WINDOWS 10-STYLE RDP SESSION READY"
+          Write-Host "==============================================="
+          Write-Host "  Host:     $host"
+          Write-Host "  Port:     3389"
+          Write-Host "  Username: $env:RDP_USER"
+          Write-Host "  Password: $env:RDP_PASSWORD"
+          Write-Host ""
+          Write-Host "  In your RDP client (XyDesk Remote):"
+          Write-Host "    $host : 3389"
+          Write-Host "==============================================="
+          Write-Host ""
+
+      # ----------------------------------------------------------------
+      # 11. Keep alive up to 6h
+      # ----------------------------------------------------------------
+      - name: Keep alive
+        shell: pwsh
+        run: |
+          Write-Host "Session will end in 6h or when this run is cancelled."
+          $end = (Get-Date).AddHours(6)
+          while ((Get-Date) -lt $end) {
+              if (-not (Get-Process cloudflared -ErrorAction SilentlyContinue)) {
+                  Write-Host "::warning::cloudflared is not running. Re-checking in 60s."
+              }
+              Start-Sleep -Seconds 60
+          }
+          Write-Host "Time limit reached, shutting down."
+
+      # ----------------------------------------------------------------
+      # 12. Teardown
+      # ----------------------------------------------------------------
+      - name: Teardown
+        if: always()
+        shell: pwsh
+        run: |
+          Get-Process cloudflared -ErrorAction SilentlyContinue | Stop-Process -Force
+          Remove-Item "$env:USERPROFILE\cloudflared*.log" -Force -ErrorAction SilentlyContinue
+          Remove-Item "$env:USERPROFILE\cloudflared.exe"  -Force -ErrorAction SilentlyContinue
+          Remove-Item "$env:TEMP\*"                  -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item "$env:USERPROFILE\AppData\Local\Temp\*" -Recurse -Force -ErrorAction SilentlyContinue
+          Write-Host "Teardown complete."

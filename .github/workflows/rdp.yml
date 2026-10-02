@@ -274,7 +274,7 @@ jobs:
           $signature = @"
           [DllImport("user32.dll")]
           public static extern bool SystemParametersInfo(uint action, uint param, string file, uint winini);
-"@
+          "@
           $type = Add-Type -MemberDefinition $signature -Name "W" -Namespace "P" -PassThru
           $type::SystemParametersInfo(0x0014, 0, "", 0x0003) | Out-Null
 

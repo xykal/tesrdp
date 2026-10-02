@@ -24,7 +24,7 @@ jobs:
 
     env:
       RDP_USER: rdpuser
-      RDP_PASSWORD: RdpFree@2026
+      RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
       TUNNEL_LOG: cloudflared.log
 
     steps:
@@ -64,7 +64,17 @@ jobs:
         shell: pwsh
         run: |
           $user = $env:RDP_USER
-          $pass = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          $plainPassword = $env:RDP_PASSWORD
+          if ([string]::IsNullOrWhiteSpace($plainPassword)) {
+              throw "Missing repository Actions secret RDP_PASSWORD."
+          }
+          if ($plainPassword.Length -lt 16) {
+              throw "RDP_PASSWORD must be at least 16 characters."
+          }
+          if ($plainPassword -match '(?i)(rdp|user)') {
+              throw "RDP_PASSWORD must not contain parts of the account name or full name (RDP User)."
+          }
+          $pass = ConvertTo-SecureString $plainPassword -AsPlainText -Force
 
           $exists = Get-LocalUser -Name $user -ErrorAction SilentlyContinue
           if ($exists) {
@@ -337,7 +347,7 @@ jobs:
           Write-Host "  Host:     $host"
           Write-Host "  Port:     3389"
           Write-Host "  Username: $env:RDP_USER"
-          Write-Host "  Password: $env:RDP_PASSWORD"
+          Write-Host "  Password: stored in Actions secret RDP_PASSWORD (not printed)"
           Write-Host ""
           Write-Host "  In your RDP client (XyDesk Remote):"
           Write-Host "    $host : 3389"
